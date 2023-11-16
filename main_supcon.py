@@ -17,11 +17,22 @@ from util import set_optimizer, save_model
 from networks.resnet_big import SupConResNet
 from losses import SupConLoss
 
-try:
-    import apex
-    from apex import amp, optimizers
-except ImportError:
-    pass
+# 0. 导入必要的包
+from datetime import timedelta
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+# from torch.cuda.amp import grad_scaler
+
+
+# 1. 定义ddp启动
+def init_ddp(local_rank):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '13004'
+    torch.cuda.set_device(local_rank)
+    os.environ['RANK']=str(local_rank)
+    dist.init_process_group(backend='nccl', rank=local_rank, init_method='env://', timeout=timedelta(seconds=60))
 
 
 def parse_option():
@@ -51,7 +62,7 @@ def parse_option():
                         help='momentum')
 
     # model dataset
-    parser.add_argument('--model', type=str, default='resnet50')
+    parser.add_argument('--model', type=str, default='resnet18')
     parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['cifar10', 'cifar100', 'path'], help='dataset')
     parser.add_argument('--mean', type=str, help='mean of dataset in path in form of str tuple')
@@ -128,6 +139,7 @@ def parse_option():
     return opt
 
 
+# 2. Dataloader uses DistributedSampler
 def set_loader(opt):
     # construct data loader
     if opt.dataset == 'cifar10':
@@ -169,31 +181,36 @@ def set_loader(opt):
         raise ValueError(opt.dataset)
 
     train_sampler = None
+    train_sampler = DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
         num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
 
     return train_loader
 
-
+# 3. 使用DDP和SyncBatchNorm
 def set_model(opt):
     model = SupConResNet(name=opt.model)
     criterion = SupConLoss(temperature=opt.temp)
 
-    # enable synchronized Batch Normalization
-    if opt.syncBN:
-        model = apex.parallel.convert_syncbn_model(model)
-
     if torch.cuda.is_available():
-        if torch.cuda.device_count() > 1:
-            model.encoder = torch.nn.DataParallel(model.encoder)
         model = model.cuda()
+
+        if torch.cuda.device_count() > 1:
+            model.encoder = DDP(model.encoder)
+        
         criterion = criterion.cuda()
         cudnn.benchmark = True
 
+
+    # enable synchronized Batch Normalization
+    if opt.syncBN:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+    
     return model, criterion
 
-
+ 
 def train(train_loader, model, criterion, optimizer, epoch, opt):
     """one epoch training"""
     model.train()
@@ -242,17 +259,20 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
         # print info
         if (idx + 1) % opt.print_freq == 0:
             print('Train: [{0}][{1}/{2}]\t'
-                  'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'loss {loss.val:.3f} ({loss.avg:.3f})'.format(
-                   epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses))
+                'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                'loss {loss.val:.3f} ({loss.avg:.3f})'.format(
+                epoch, idx + 1, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses))
             sys.stdout.flush()
 
     return losses.avg
 
+# 5. main 参数列表更新:添加额外参数 local rank，该参数无需在mp.spawn()函数中传递，系统会自动分配;
+# 进程初始化:调用init _ddp()函数实现;
+def main(local_rank):
+    init_ddp(local_rank) 
 
-def main():
     opt = parse_option()
 
     # build data loader
@@ -293,4 +313,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # 6. 设置环境变量
+    os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
+    world_size = torch.cuda.device_count()
+    os.environ['WORLD_SIZE'] =str(world_size)
+    mp.spawn(fn = main,nprocs=world_size)
+    # main()
